@@ -10,11 +10,9 @@ import threading
 import customtkinter as ctk
 from PIL import Image, ImageTk
 
-# Set appearance and theme
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("blue")
 
-# MediaPipe initialization
 mp_pose = mp.solutions.pose
 mp_face_mesh = mp.solutions.face_mesh
 
@@ -23,15 +21,16 @@ RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
 def play_alert_sound():
     def sound_worker():
-        winsound.Beep(880, 250)
+        winsound.Beep(900, 300)
     threading.Thread(target=sound_worker, daemon=True).start()
 
-def calculate_angle(p1, p2):
-    x1, y1 = p1
-    x2, y2 = p2
-    if x2 - x1 == 0:
+def get_vertical_angle(p_bottom, p_top):
+    """Calculates angle of line relative to the vertical axis (0 deg = upright)."""
+    dx = p_top[0] - p_bottom[0]
+    dy = p_bottom[1] - p_top[1]  # Invert because image y-axis points down
+    if dy <= 0:
         return 90.0
-    return np.degrees(np.arctan2(abs(y2 - y1), abs(x2 - x1)))
+    return np.degrees(np.arctan2(abs(dx), dy))
 
 def get_ear(landmarks, eye_indices, img_w, img_h):
     coords = [(landmarks[i].x * img_w, landmarks[i].y * img_h) for i in eye_indices]
@@ -41,29 +40,30 @@ def get_ear(landmarks, eye_indices, img_w, img_h):
     h = np.linalg.norm(np.array(p1) - np.array(p4))
     return (v1 + v2) / (2.0 * h) if h > 0 else 0.0
 
-class ErgoVisionApp(ctk.CTk):
+class ErgoVisionProApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
-        self.title("ErgoVision - AI Ergonomics & Fatigue Monitor")
-        self.geometry("980x640")
+        self.title("ErgoVision Pro - AI Ergonomics & Fatigue Telemetry")
+        self.geometry("1040x680")
         self.resizable(False, False)
 
-        # Video capture & tracking states
         self.cap = None
         self.is_running = False
         self.pose = None
         self.face_mesh = None
 
-        # Analytics & Thresholds
-        self.POSTURE_THRESHOLD = 8.0
-        self.SLOUCH_TIME_LIMIT = 3.0
-        self.slouch_start_time = None
+        # Thresholds
+        self.NECK_SLOUCH_THRESHOLD = 32.0  # degrees from vertical
+        self.PROXIMITY_THRESHOLD = 175.0   # inter-ocular pixel distance
+        self.DROWSY_EAR_THRESHOLD = 0.23   # half-closed eyelids
+        self.BLINK_EAR_THRESHOLD = 0.20    # full blink closure
+
+        # Telemetry State
+        self.neck_slouch_start = None
+        self.drowsy_start = None
         self.last_alert_time = 0
-        
-        # Optimized Blink Detector State
-        self.EAR_THRESHOLD = 0.235  # Tuned for natural desktop distance
-        self.eye_closed = False     # State flag for instantaneous blink capture
+        self.eye_closed = False
         self.blink_count = 0
         self.session_start = time.time()
 
@@ -74,25 +74,26 @@ class ErgoVisionApp(ctk.CTk):
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
 
-        # Left: Video Frame
+        # Video Viewport
         self.video_frame = ctk.CTkFrame(self, corner_radius=12)
         self.video_frame.grid(row=0, column=0, padx=15, pady=15, sticky="nsew")
 
         self.video_label = ctk.CTkLabel(self.video_frame, text="Click 'Start Monitoring' to Begin", font=("Segoe UI", 16))
         self.video_label.pack(expand=True, fill="both", padx=10, pady=10)
 
-        # Right: Dashboard Control & Metrics
+        # Dashboard Sidebar
         self.dash_frame = ctk.CTkFrame(self, corner_radius=12)
         self.dash_frame.grid(row=0, column=1, padx=(0, 15), pady=15, sticky="nsew")
 
-        ctk.CTkLabel(self.dash_frame, text="ErgoVision", font=("Segoe UI", 24, "bold")).pack(pady=(15, 5))
-        ctk.CTkLabel(self.dash_frame, text="Real-Time Telemetry", font=("Segoe UI", 12), text_color="gray").pack(pady=(0, 15))
+        ctk.CTkLabel(self.dash_frame, text="ErgoVision Pro", font=("Segoe UI", 24, "bold")).pack(pady=(15, 2))
+        ctk.CTkLabel(self.dash_frame, text="Real-Time Health Telemetry", font=("Segoe UI", 11), text_color="gray").pack(pady=(0, 10))
 
-        self.card_posture = self._create_metric_card(self.dash_frame, "POSTURE STATUS", "Idle", "#333333")
-        self.card_tilt = self._create_metric_card(self.dash_frame, "SHOULDER TILT", "0.0°", "#333333")
-        self.card_ear = self._create_metric_card(self.dash_frame, "LIVE EAR", "0.00", "#333333")
-        self.card_blinks = self._create_metric_card(self.dash_frame, "TOTAL BLINKS", "0", "#333333")
-        self.card_bpm = self._create_metric_card(self.dash_frame, "BLINK RATE", "0 /min", "#333333")
+        # Metric Cards
+        self.card_alert = self._create_metric_card(self.dash_frame, "ACTIVE ADVISORY", "System Idle", "#242424")
+        self.card_neck = self._create_metric_card(self.dash_frame, "FORWARD HEAD / NECK", "0.0° (Optimal)", "#242424")
+        self.card_dist = self._create_metric_card(self.dash_frame, "SCREEN PROXIMITY", "Safe Distance", "#242424")
+        self.card_drowsy = self._create_metric_card(self.dash_frame, "EYE ENGAGEMENT", "Attentive", "#242424")
+        self.card_bpm = self._create_metric_card(self.dash_frame, "BLINK RATE / STATUS", "0 /min", "#242424")
 
         self.btn_toggle = ctk.CTkButton(
             self.dash_frame,
@@ -106,14 +107,18 @@ class ErgoVisionApp(ctk.CTk):
 
     def _create_metric_card(self, parent, title, initial_val, bg_color):
         frame = ctk.CTkFrame(parent, corner_radius=8, fg_color=bg_color)
-        frame.pack(fill="x", padx=15, pady=5)
-        
+        frame.pack(fill="x", padx=15, pady=4)
         lbl_title = ctk.CTkLabel(frame, text=title, font=("Segoe UI", 10, "bold"), text_color="#aaaaaa")
-        lbl_title.pack(anchor="w", padx=12, pady=(6, 0))
-        
-        lbl_val = ctk.CTkLabel(frame, text=initial_val, font=("Segoe UI", 18, "bold"))
-        lbl_val.pack(anchor="w", padx=12, pady=(0, 6))
+        lbl_title.pack(anchor="w", padx=10, pady=(4, 0))
+        lbl_val = ctk.CTkLabel(frame, text=initial_val, font=("Segoe UI", 15, "bold"))
+        lbl_val.pack(anchor="w", padx=10, pady=(0, 6))
         return lbl_val
+
+    def trigger_advisory(self, message, curr_time):
+        self.card_alert.configure(text=message, text_color="#e63946")
+        if curr_time - self.last_alert_time > 4.0:
+            play_alert_sound()
+            self.last_alert_time = curr_time
 
     def toggle_monitoring(self):
         if not self.is_running:
@@ -127,7 +132,6 @@ class ErgoVisionApp(ctk.CTk):
             self.is_running = True
             self.session_start = time.time()
             self.blink_count = 0
-            self.eye_closed = False
             self.btn_toggle.configure(text="Stop Monitoring", fg_color="#a83232")
             self.update_feed()
         else:
@@ -153,72 +157,95 @@ class ErgoVisionApp(ctk.CTk):
             pose_res = self.pose.process(rgb_frame)
             face_res = self.face_mesh.process(rgb_frame)
 
-            # --- 1. Posture Tracking ---
-            shoulder_angle = 0.0
-            is_slouching = False
+            primary_advisory = "Normal / Good Posture"
+            advisory_active = False
 
+            # --- 1. Forward-Head / Tech-Neck Slouch Tracking ---
+            neck_angle = 0.0
             if pose_res.pose_landmarks:
                 lm = pose_res.pose_landmarks.landmark
-                p1 = (int(lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x * w), int(lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y * h))
-                p2 = (int(lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x * w), int(lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y * h))
-                shoulder_angle = calculate_angle(p1, p2)
-                is_slouching = shoulder_angle > self.POSTURE_THRESHOLD
+                r_ear = (int(lm[mp_pose.PoseLandmark.RIGHT_EAR.value].x * w), int(lm[mp_pose.PoseLandmark.RIGHT_EAR.value].y * h))
+                r_shoulder = (int(lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x * w), int(lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y * h))
 
-                if is_slouching:
-                    if self.slouch_start_time is None:
-                        self.slouch_start_time = curr_time
-                    elif curr_time - self.slouch_start_time >= self.SLOUCH_TIME_LIMIT:
-                        if curr_time - self.last_alert_time > 4.0:
-                            play_alert_sound()
-                            self.last_alert_time = curr_time
+                neck_angle = get_vertical_angle(r_shoulder, r_ear)
+
+                if neck_angle > self.NECK_SLOUCH_THRESHOLD:
+                    if self.neck_slouch_start is None:
+                        self.neck_slouch_start = curr_time
+                    elif curr_time - self.neck_slouch_start >= 2.5:
+                        primary_advisory = "Chin up! Tech neck detected"
+                        advisory_active = True
+                        self.card_neck.configure(text=f"{neck_angle:.1f}° (Slouching)", text_color="#e63946")
                 else:
-                    self.slouch_start_time = None
+                    self.neck_slouch_start = None
+                    self.card_neck.configure(text=f"{neck_angle:.1f}° (Optimal)", text_color="#2a9d8f")
 
-                line_color = (220, 50, 50) if is_slouching else (50, 220, 50)
-                cv2.line(frame, p1, p2, line_color, 3)
+                line_col = (0, 0, 255) if neck_angle > self.NECK_SLOUCH_THRESHOLD else (0, 255, 0)
+                cv2.line(frame, r_shoulder, r_ear, line_col, 3)
+                cv2.circle(frame, r_ear, 4, (255, 0, 0), -1)
 
-            # --- 2. Robust State-Machine Blink Tracking ---
-            avg_ear = 0.0
+            # --- 2. Screen Distance & Eye Telemetry ---
             if face_res.multi_face_landmarks:
                 f_lm = face_res.multi_face_landmarks[0].landmark
-                left_ear = get_ear(f_lm, LEFT_EYE, w, h)
-                right_ear = get_ear(f_lm, RIGHT_EYE, w, h)
-                avg_ear = (left_ear + right_ear) / 2.0
 
-                # State machine: tracks the exact transition from closed -> open
-                if avg_ear < self.EAR_THRESHOLD:
+                # Proximity Check (Inter-ocular distance)
+                left_outer = (f_lm[33].x * w, f_lm[33].y * h)
+                right_outer = (f_lm[263].x * w, f_lm[263].y * h)
+                face_pixel_dist = np.linalg.norm(np.array(left_outer) - np.array(right_outer))
+
+                if face_pixel_dist > self.PROXIMITY_THRESHOLD:
+                    primary_advisory = "Too close to screen! Sit back"
+                    advisory_active = True
+                    self.card_dist.configure(text=f"{int(face_pixel_dist)} px (Too Close)", text_color="#e63946")
+                else:
+                    self.card_dist.configure(text=f"{int(face_pixel_dist)} px (Safe Distance)", text_color="#2a9d8f")
+
+                # Drowsy / Half-closed Lids vs Blinks
+                avg_ear = (get_ear(f_lm, LEFT_EYE, w, h) + get_ear(f_lm, RIGHT_EYE, w, h)) / 2.0
+
+                if avg_ear < self.DROWSY_EAR_THRESHOLD:
+                    if self.drowsy_start is None:
+                        self.drowsy_start = curr_time
+                    elif curr_time - self.drowsy_start >= 1.8:
+                        primary_advisory = "Eye strain / Heavy eyelids!"
+                        advisory_active = True
+                        self.card_drowsy.configure(text=f"EAR {avg_ear:.2f} (Drowsy)", text_color="#e63946")
+                else:
+                    self.drowsy_start = None
+                    self.card_drowsy.configure(text=f"EAR {avg_ear:.2f} (Attentive)", text_color="#2a9d8f")
+
+                if avg_ear < self.BLINK_EAR_THRESHOLD:
                     self.eye_closed = True
-                    dot_color = (0, 0, 255)  # Red dots when eyes register closed
                 else:
                     if self.eye_closed:
                         self.blink_count += 1
                         self.eye_closed = False
-                    dot_color = (0, 255, 0)  # Green dots when eyes are open
 
-                # Visual landmark feedback on eyelids
-                for idx in LEFT_EYE + RIGHT_EYE:
-                    pt = (int(f_lm[idx].x * w), int(f_lm[idx].y * h))
-                    cv2.circle(frame, pt, 2, dot_color, -1)
-
-            # --- 3. Telemetry Updates ---
-            posture_text = "SLOUCHING" if is_slouching else "OPTIMAL"
-            posture_color = "#e63946" if is_slouching else "#2a9d8f"
-            self.card_posture.configure(text=posture_text, text_color=posture_color)
-            self.card_tilt.configure(text=f"{shoulder_angle:.1f}°")
-            self.card_ear.configure(text=f"{avg_ear:.2f}")
-            self.card_blinks.configure(text=str(self.blink_count))
-
+            # --- 3. Blink Rate Analytics ---
             elapsed = (curr_time - self.session_start) / 60.0
-            bpm = int(self.blink_count / elapsed) if elapsed > 0.05 else self.blink_count
-            self.card_bpm.configure(text=f"{bpm} /min")
+            bpm = int(self.blink_count / elapsed) if elapsed > 0.1 else self.blink_count
 
-            # Convert frame for CustomTkinter
+            if elapsed > 0.5 and bpm < 8:
+                primary_advisory = "Dry Eye Warning! Blink frequently"
+                advisory_active = True
+                self.card_bpm.configure(text=f"{bpm} /min (Low)", text_color="#e63946")
+            else:
+                self.card_bpm.configure(text=f"{bpm} /min (Normal)", text_color="#2a9d8f")
+
+            # --- 4. Alert Dispatcher ---
+            if advisory_active:
+                self.trigger_advisory(primary_advisory, curr_time)
+                cv2.rectangle(frame, (0, 0), (w, 40), (0, 0, 220), -1)
+                cv2.putText(frame, f"! {primary_advisory} !", (w // 2 - 200, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            else:
+                self.card_alert.configure(text="All Metrics Optimal", text_color="#2a9d8f")
+
+            # Update Frame
             img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(img)
             img_tk = ctk.CTkImage(light_image=img, dark_image=img, size=(600, 450))
             self.video_label.configure(image=img_tk, text="")
 
-        # Poll faster (15 ms) for smooth tracking
         self.after(15, self.update_feed)
 
     def on_closing(self):
@@ -228,6 +255,6 @@ class ErgoVisionApp(ctk.CTk):
         self.destroy()
 
 if __name__ == "__main__":
-    app = ErgoVisionApp()
+    app = ErgoVisionProApp()
     app.protocol("WM_DELETE_WINDOW", app.on_closing)
     app.mainloop()
