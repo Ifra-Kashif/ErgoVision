@@ -19,3 +19,11 @@ dist/
 .idea/
 .DS_Store
 Thumbs.db
+# Local Database & Analytics Storage
+*.db
+*.sqlite3
+.data/
+# PyInstaller Output
+dist/
+build/
+*.spec
